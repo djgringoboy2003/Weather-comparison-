@@ -1,0 +1,25 @@
+[Unit]
+Description=Weather Comparison consensus web app
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=www-data
+Group=www-data
+Environment=WEATHER_HOST=127.0.0.1
+Environment=WEATHER_PORT=3020
+# Self-identifying contact for upstream APIs (MET Norway requires this).
+Environment="WEATHER_USER_AGENT=weather-compare/1.1 (+https://rabmclean.online/weather/)"
+WorkingDirectory=/opt/weather-compare
+ExecStart=/usr/bin/python3 -m weather_compare.web
+Restart=on-failure
+RestartSec=3
+# Hardening: the app only needs to read its own files and make outbound HTTPS.
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+
+[Install]
+WantedBy=multi-user.target
