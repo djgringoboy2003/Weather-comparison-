@@ -103,6 +103,9 @@ class Handler(BaseHTTPRequestHandler):
         self.send_response(status)
         self.send_header("Content-Type", content_type)
         self.send_header("Content-Length", str(len(body)))
+        # Always revalidate: the page and data are dynamic, and caching the HTML
+        # would otherwise serve a stale UI after a deploy.
+        self.send_header("Cache-Control", "no-cache")
         self.end_headers()
         if self.command != "HEAD":
             self.wfile.write(body)
