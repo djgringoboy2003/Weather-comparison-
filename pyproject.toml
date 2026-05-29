@@ -1,0 +1,17 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "weather-compare"
+version = "1.0.0"
+description = "Compare multiple weather models and predict the most likely forecast."
+readme = "README.md"
+requires-python = ">=3.9"
+dependencies = []  # standard library only
+
+[project.scripts]
+weather-compare = "weather_compare.cli:main"
+
+[tool.setuptools]
+packages = ["weather_compare"]
