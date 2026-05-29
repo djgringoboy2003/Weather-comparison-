@@ -15,9 +15,13 @@ from dataclasses import dataclass, field
 
 from .model import SourceForecast, code_category
 
-# Spread thresholds (deg C) for the temperature-agreement confidence band.
-_TEMP_HIGH = 1.5
-_TEMP_MED = 3.0
+# Std-dev thresholds (deg C) for the temperature-agreement confidence band.
+# We score agreement on the standard deviation of the per-source highs, not the
+# raw max-min range: the range only sees the two most extreme models and grows
+# as more models are added, so a single outlier (or simply having 6 sources)
+# would unfairly push confidence down even when most models agree closely.
+_TEMP_STD_HIGH = 1.0
+_TEMP_STD_MED = 2.0
 # A day is "wet" for a source if it predicts at least this much precip.
 _WET_MM = 0.5
 
@@ -168,10 +172,10 @@ def _confidence(tmax_vals: list[float], wet_flags: list[bool]) -> str:
     if len(tmax_vals) < 2:
         return "Low"  # single source -> nothing to corroborate
 
-    spread = max(tmax_vals) - min(tmax_vals)
-    if spread <= _TEMP_HIGH:
+    std = statistics.pstdev(tmax_vals)
+    if std <= _TEMP_STD_HIGH:
         temp_band = "High"
-    elif spread <= _TEMP_MED:
+    elif std <= _TEMP_STD_MED:
         temp_band = "Medium"
     else:
         temp_band = "Low"
