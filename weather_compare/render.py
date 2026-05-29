@@ -121,6 +121,7 @@ def to_dict(
                 "precip_mm": d.precip_mm,
                 "precip_chance_pct": d.precip_chance,
                 "condition": d.condition,
+                "condition_category": d.condition_category,
                 "confidence": d.confidence,
                 "n_sources": d.n_sources,
                 "per_source_temp_max_c": {

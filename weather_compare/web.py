@@ -18,17 +18,86 @@ import argparse
 import datetime as _dt
 import json
 import os
+import threading
+import time
+from collections import deque
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
 
 from .compare import build_consensus
 from .geocode import GEOCODE_URL, LocationNotFound, geocode
 from .http import HTTPError, get_json
+from .model import Location
 from .render import to_dict
 from .sources import fetch_all
 
 MAX_DAYS = 16
 MAX_SUGGESTIONS = 8
+
+# How long to reuse a fetched forecast / suggestion before going upstream again.
+FORECAST_TTL = 30 * 60     # 30 min — model runs update a few times a day
+SUGGEST_TTL = 6 * 60 * 60  # 6 h — place names are effectively static
+# Simple per-client abuse guard (the endpoints proxy rate-limited upstream APIs).
+RATE_LIMIT = 60            # requests ...
+RATE_WINDOW = 60           # ... per this many seconds, per client IP
+
+
+class TTLCache:
+    """Tiny thread-safe time-to-live cache with rough LRU-ish eviction."""
+
+    def __init__(self, ttl: float, maxsize: int = 512) -> None:
+        self.ttl = ttl
+        self.maxsize = maxsize
+        self._d: dict = {}
+        self._lock = threading.Lock()
+
+    def get(self, key):
+        now = time.monotonic()
+        with self._lock:
+            hit = self._d.get(key)
+            if hit is None:
+                return None
+            ts, value = hit
+            if now - ts > self.ttl:
+                self._d.pop(key, None)
+                return None
+            return value
+
+    def set(self, key, value) -> None:
+        with self._lock:
+            if len(self._d) >= self.maxsize and key not in self._d:
+                oldest = min(self._d, key=lambda k: self._d[k][0])
+                self._d.pop(oldest, None)
+            self._d[key] = (time.monotonic(), value)
+
+
+class RateLimiter:
+    """Fixed-window-ish per-key limiter using a timestamp deque."""
+
+    def __init__(self, limit: int, window: float) -> None:
+        self.limit = limit
+        self.window = window
+        self._hits: dict[str, deque] = {}
+        self._lock = threading.Lock()
+
+    def allow(self, key: str) -> bool:
+        now = time.monotonic()
+        with self._lock:
+            dq = self._hits.setdefault(key, deque())
+            while dq and now - dq[0] > self.window:
+                dq.popleft()
+            if not dq and key in self._hits:
+                # keep the dict from growing unbounded for one-off clients
+                pass
+            if len(dq) >= self.limit:
+                return False
+            dq.append(now)
+            return True
+
+
+_forecast_cache = TTLCache(FORECAST_TTL)
+_suggest_cache = TTLCache(SUGGEST_TTL)
+_rate_limiter = RateLimiter(RATE_LIMIT, RATE_WINDOW)
 
 
 def suggest_locations(query: str) -> list[dict]:
@@ -66,14 +135,27 @@ def suggest_locations(query: str) -> list[dict]:
     return out
 
 
-def build_payload(location_query: str, days: int, include_metno: bool) -> dict:
+def build_payload(
+    location_query: str | None,
+    days: int,
+    include_metno: bool,
+    *,
+    coords: tuple[float, float] | None = None,
+) -> dict:
     """Run the full pipeline and return a JSON-serialisable consensus payload.
 
-    Raises :class:`LocationNotFound` if the place can't be resolved, or
+    Resolve ``location_query`` via geocoding, or use ``coords`` (lat, lon)
+    directly when the browser supplies its position. Raises
+    :class:`LocationNotFound` if the place can't be resolved, or
     :class:`RuntimeError` if no weather sources were reachable.
     """
     days = max(1, min(days, MAX_DAYS))
-    location = geocode(location_query)
+    if coords is not None:
+        lat, lon = coords
+        location = Location(name=f"{lat:.3f}, {lon:.3f}", latitude=lat,
+                            longitude=lon, timezone="auto")
+    else:
+        location = geocode(location_query or "")
 
     warnings: list[str] = []
     sources = fetch_all(
@@ -94,8 +176,31 @@ def build_payload(location_query: str, days: int, include_metno: bool) -> dict:
     return payload
 
 
+def cached_forecast(
+    location_query: str | None,
+    days: int,
+    include_metno: bool,
+    *,
+    coords: tuple[float, float] | None = None,
+) -> dict:
+    """:func:`build_payload` with a TTL cache so repeat views (and shared
+    links) don't re-hit the upstream model APIs every time."""
+    days = max(1, min(days, MAX_DAYS))
+    if coords is not None:
+        key = (round(coords[0], 3), round(coords[1], 3), days, include_metno)
+    else:
+        key = ((location_query or "").strip().lower(), days, include_metno)
+
+    hit = _forecast_cache.get(key)
+    if hit is not None:
+        return hit
+    payload = build_payload(location_query, days, include_metno, coords=coords)
+    _forecast_cache.set(key, payload)
+    return payload
+
+
 class Handler(BaseHTTPRequestHandler):
-    server_version = "weather-compare/1.0"
+    server_version = "weather-compare/1.1"
     protocol_version = "HTTP/1.1"
 
     # --- helpers ---------------------------------------------------------- #
@@ -114,6 +219,14 @@ class Handler(BaseHTTPRequestHandler):
         self._send(status, json.dumps(obj).encode("utf-8"),
                    "application/json; charset=utf-8")
 
+    def _client_ip(self) -> str:
+        # Behind the Apache reverse proxy the real client is in X-Forwarded-For;
+        # fall back to the socket peer for direct connections.
+        xff = self.headers.get("X-Forwarded-For")
+        if xff:
+            return xff.split(",")[0].strip()
+        return self.client_address[0]
+
     # --- routing ---------------------------------------------------------- #
     def do_GET(self) -> None:  # noqa: N802 (stdlib naming)
         path = urlparse(self.path).path.rstrip("/") or "/"
@@ -123,6 +236,8 @@ class Handler(BaseHTTPRequestHandler):
                        "text/html; charset=utf-8")
         elif path == "/health":
             self._send(200, b"ok", "text/plain; charset=utf-8")
+        elif path == "/favicon.ico":
+            self._send(200, FAVICON_SVG, "image/svg+xml")
         elif path == "/api":
             self._handle_api()
         elif path == "/suggest":
@@ -133,10 +248,24 @@ class Handler(BaseHTTPRequestHandler):
     do_HEAD = do_GET
 
     def _handle_api(self) -> None:
+        if not _rate_limiter.allow(self._client_ip()):
+            self._send_json(429, {"error": "rate limit exceeded, slow down"})
+            return
+
         qs = parse_qs(urlparse(self.path).query)
+        lat = (qs.get("lat") or [""])[0].strip()
+        lon = (qs.get("lon") or [""])[0].strip()
         location = (qs.get("location") or [""])[0].strip()
-        if not location:
-            self._send_json(400, {"error": "missing 'location' parameter"})
+
+        coords = None
+        if lat and lon:
+            try:
+                coords = (float(lat), float(lon))
+            except ValueError:
+                self._send_json(400, {"error": "'lat'/'lon' must be numbers"})
+                return
+        elif not location:
+            self._send_json(400, {"error": "missing 'location' (or 'lat'+'lon')"})
             return
 
         try:
@@ -148,7 +277,7 @@ class Handler(BaseHTTPRequestHandler):
         include_metno = (qs.get("no_metno") or ["0"])[0] not in ("1", "true", "yes")
 
         try:
-            payload = build_payload(location, days, include_metno)
+            payload = cached_forecast(location, days, include_metno, coords=coords)
         except LocationNotFound as exc:
             self._send_json(404, {"error": str(exc)})
         except RuntimeError as exc:
@@ -159,12 +288,19 @@ class Handler(BaseHTTPRequestHandler):
             self._send_json(200, payload)
 
     def _handle_suggest(self) -> None:
+        if not _rate_limiter.allow(self._client_ip()):
+            self._send_json(429, {"results": []})
+            return
         qs = parse_qs(urlparse(self.path).query)
-        query = (qs.get("q") or [""])[0]
-        try:
-            results = suggest_locations(query)
-        except Exception:  # defensive: autocomplete must never break the page
-            results = []
+        query = (qs.get("q") or [""])[0].strip()
+        key = query.lower()
+        results = _suggest_cache.get(key)
+        if results is None:
+            try:
+                results = suggest_locations(query)
+            except Exception:  # defensive: autocomplete must never break the page
+                results = []
+            _suggest_cache.set(key, results)
         self._send_json(200, {"results": results})
 
     def log_message(self, fmt: str, *args) -> None:
@@ -196,6 +332,15 @@ def main(argv: list[str] | None = None) -> int:
     return 0
 
 
+# A tiny sun-behind-cloud favicon, served inline so there's no static asset.
+FAVICON_SVG = (
+    b'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64">'
+    b'<circle cx="25" cy="25" r="11" fill="#fbbf24"/>'
+    b'<path d="M18 46h26a9 9 0 0 0 .6-18 13 13 0 0 0-25 2.5A8.5 8.5 0 0 0 18 46z" '
+    b'fill="#cbd5e1"/></svg>'
+)
+
+
 # --------------------------------------------------------------------------- #
 # Front-end: a single self-contained page. Kept inline so the server has no
 # static-file dependencies. All fetch/asset URLs are relative ("api?...") so it
@@ -207,6 +352,7 @@ INDEX_HTML = r"""<!DOCTYPE html>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Weather Consensus</title>
+<link rel="icon" href="favicon.ico">
 <style>
   :root{
     --bg:#0f172a; --panel:#1e293b; --panel2:#334155; --ink:#e2e8f0;
@@ -240,6 +386,7 @@ INDEX_HTML = r"""<!DOCTYPE html>
   button{background:var(--accent);color:#04212e;border:0;padding:11px 20px;border-radius:9px;
     font-size:1rem;font-weight:600;cursor:pointer}
   button:disabled{opacity:.6;cursor:default}
+  button.ghost{background:var(--panel2);color:var(--ink);font-weight:600}
   .chk{display:flex;align-items:center;gap:8px;font-size:.85rem;color:var(--muted)}
   #status{margin:20px 0;color:var(--muted)}
   #status.error{color:var(--low)}
@@ -250,9 +397,17 @@ INDEX_HTML = r"""<!DOCTYPE html>
   .srcs span{background:var(--panel2);border-radius:999px;padding:3px 11px;font-size:.78rem;color:var(--ink)}
   .grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(180px,1fr));gap:12px;margin-top:14px}
   .card{background:var(--panel);border:1px solid var(--border);border-radius:14px;padding:14px}
+  .card .top{display:flex;justify-content:space-between;align-items:flex-start}
   .card .day{font-weight:700;font-size:1.05rem}
   .card .date{color:var(--muted);font-size:.78rem;margin-bottom:8px}
+  .card .icon{font-size:1.7rem;line-height:1}
   .card .cond{font-size:.92rem;margin-bottom:10px;min-height:2.6em}
+  details.why{margin-top:10px;font-size:.78rem;color:var(--muted)}
+  details.why summary{cursor:pointer;color:var(--accent);list-style:none}
+  details.why summary::-webkit-details-marker{display:none}
+  details.why ul{list-style:none;margin:8px 0 0;padding:0}
+  details.why li{display:flex;justify-content:space-between;padding:2px 0}
+  details.why li b{color:var(--ink);font-weight:600}
   .temps{display:flex;align-items:baseline;gap:8px}
   .temps .hi{font-size:1.7rem;font-weight:700}
   .temps .lo{color:var(--muted)}
@@ -319,6 +474,7 @@ INDEX_HTML = r"""<!DOCTYPE html>
       </div>
     </div>
     <button type="submit" id="go">Forecast</button>
+    <button type="button" id="geo" class="ghost" title="Use my current location">📍 My location</button>
   </form>
 
   <div id="status"></div>
@@ -395,27 +551,46 @@ const cToF = c => c == null ? null : c * 9/5 + 32;
 const mmToIn = mm => mm == null ? null : mm / 25.4;
 const wd = d => { const x = new Date(d + 'T00:00:00'); return isNaN(x) ? '?' : x.toLocaleDateString(undefined,{weekday:'short'}); };
 
-let last = null;   // {data, imperial, query, days} of the current view, for sharing
+const ICON = {clear:'☀️',cloud:'☁️',fog:'🌫️',drizzle:'🌦️',rain:'🌧️',snow:'❄️',storm:'⛈️'};
+const LAST_KEY = 'wc:lastLocation';
 
-f.addEventListener('submit', async e => {
-  e.preventDefault();
+let last = null;   // {data, imperial, query?, coords?, days} of current view, for sharing
+
+f.addEventListener('submit', e => { e.preventDefault(); runForecast({query: loc.value.trim()}); });
+
+document.getElementById('geo').addEventListener('click', () => {
+  if (!navigator.geolocation){ toast('Geolocation is not available'); return; }
+  statusEl.className = ''; statusEl.textContent = 'Locating you…';
+  navigator.geolocation.getCurrentPosition(
+    pos => runForecast({coords: {lat: pos.coords.latitude, lon: pos.coords.longitude}}),
+    err => { statusEl.className = 'error'; statusEl.textContent = 'Location error: ' + err.message; },
+    {enableHighAccuracy: false, timeout: 10000, maximumAge: 600000});
+});
+
+// Single forecast path for both the search box and the geolocation button.
+async function runForecast(opts){
   closeAc();
-  const query = loc.value.trim();
-  if (!query) return;
   const days = document.getElementById('days').value;
   const imperial = document.getElementById('units').value === 'imperial';
+  let url;
+  if (opts.coords){
+    url = 'api?lat=' + opts.coords.lat + '&lon=' + opts.coords.lon + '&days=' + days;
+  } else {
+    if (!opts.query) return;
+    url = 'api?location=' + encodeURIComponent(opts.query) + '&days=' + days;
+  }
   go.disabled = true;
   statusEl.className = '';
-  statusEl.textContent = 'Fetching ' + query + ' over ' + days + ' days across models…';
+  statusEl.textContent = 'Combining models' + (opts.query ? ' for ' + opts.query : '') + '…';
   result.innerHTML = '';
   try {
-    const r = await fetch('api?location=' + encodeURIComponent(query) + '&days=' + days);
+    const r = await fetch(url);
     const data = await r.json();
     if (!r.ok) throw new Error(data.error || ('HTTP ' + r.status));
-    last = {data, imperial, query, days};
+    last = {data, imperial, days, query: opts.query || null, coords: opts.coords || null};
+    if (opts.query) try { localStorage.setItem(LAST_KEY, opts.query); } catch {}
     render(data, imperial);
-    // Make the current view shareable / bookmarkable without a reload.
-    history.replaceState(null, '', shareUrl());
+    history.replaceState(null, '', shareUrl());  // shareable / bookmarkable
     statusEl.textContent = '';
   } catch (err) {
     statusEl.className = 'error';
@@ -423,7 +598,7 @@ f.addEventListener('submit', async e => {
   } finally {
     go.disabled = false;
   }
-});
+}
 
 function render(data, imperial){
   const ut = imperial ? '°F' : '°C';
@@ -431,16 +606,26 @@ function render(data, imperial){
   const t = c => c == null ? '–' : Math.round(imperial ? cToF(c) : c) + '°';
   const p = mm => mm == null ? '–' : (imperial ? mmToIn(mm).toFixed(2) : mm.toFixed(1)) + ' ' + up;
 
+  const perSource = d => {
+    const e = d.per_source_temp_max_c || {};
+    const rows = Object.keys(e).map(k =>
+      `<li><span>${k}</span><b>${t(e[k])}</b></li>`).join('');
+    return rows ? `<details class="why"><summary>Per-model highs</summary><ul>${rows}</ul></details>` : '';
+  };
+
   const cards = data.forecast.map(d => `
     <div class="card">
-      <div class="day">${wd(d.date)}</div>
-      <div class="date">${d.date}</div>
+      <div class="top">
+        <div><div class="day">${wd(d.date)}</div><div class="date">${d.date}</div></div>
+        <div class="icon" title="${d.condition}">${ICON[d.condition_category] || '🌡️'}</div>
+      </div>
       <div class="cond">${d.condition}</div>
       <div class="temps"><span class="hi">${t(d.temp_max_c)}</span><span class="lo">${t(d.temp_min_c)}</span></div>
       <div class="row"><span>Rain chance</span><b>${d.precip_chance_pct == null ? '–' : d.precip_chance_pct + '%'}</b></div>
       <div class="row"><span>Precip</span><b>${p(d.precip_mm)}</b></div>
       <div class="row"><span>Model spread</span><b>${d.temp_max_spread_c == null ? '–' : '±' + (imperial ? (d.temp_max_spread_c*9/5).toFixed(1) : d.temp_max_spread_c.toFixed(1)) + ut}</b></div>
       <div class="conf ${d.confidence}"><span class="dot"></span>${d.confidence} confidence · ${d.n_sources} models</div>
+      ${perSource(d)}
     </div>`).join('');
 
   const warn = (data.warnings && data.warnings.length)
@@ -467,7 +652,12 @@ function shareUrl(){
   if (!last) return location.href;
   const u = new URL(location.href);
   u.search = '';
-  u.searchParams.set('location', last.query);
+  if (last.coords){
+    u.searchParams.set('lat', last.coords.lat.toFixed(4));
+    u.searchParams.set('lon', last.coords.lon.toFixed(4));
+  } else {
+    u.searchParams.set('location', last.query);
+  }
   u.searchParams.set('days', last.days);
   u.searchParams.set('units', last.imperial ? 'imperial' : 'metric');
   return u.toString();
@@ -506,15 +696,24 @@ function toast(msg){
   toastTimer = setTimeout(() => el.classList.remove('show'), 2600);
 }
 
-// --- deep links: ?location=&days=&units= auto-runs the forecast on load ----
+// --- deep links + remembered location -------------------------------------
+// ?location=&days=&units= (or ?lat=&lon=) auto-runs the forecast on load;
+// otherwise prefill the search box with the last place the user looked up.
 (function initFromUrl(){
   const p = new URLSearchParams(location.search);
-  const ql = p.get('location');
-  if (!ql) return;
-  loc.value = ql;
-  const d = p.get('days'); if (d && [...document.getElementById('days').options].some(o => o.value === d)) document.getElementById('days').value = d;
+  const d = p.get('days');
+  if (d && [...document.getElementById('days').options].some(o => o.value === d)) document.getElementById('days').value = d;
   const u = p.get('units'); if (u === 'imperial' || u === 'metric') document.getElementById('units').value = u;
-  if (f.requestSubmit) f.requestSubmit(); else f.dispatchEvent(new Event('submit'));
+
+  const lat = p.get('lat'), lon = p.get('lon'), ql = p.get('location');
+  if (lat && lon && !isNaN(+lat) && !isNaN(+lon)){
+    runForecast({coords: {lat: +lat, lon: +lon}});
+  } else if (ql){
+    loc.value = ql;
+    runForecast({query: ql});
+  } else {
+    try { const saved = localStorage.getItem(LAST_KEY); if (saved) loc.value = saved; } catch {}
+  }
 })();
 </script>
 </body>
