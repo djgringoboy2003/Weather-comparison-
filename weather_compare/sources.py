@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import datetime as _dt
 from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor
 
 from .http import HTTPError, get_json
 from .model import DayForecast, Location, SourceForecast
@@ -37,7 +38,9 @@ _DAILY_VARS = [
 # Model id -> (display name, ensemble weight). Weights reflect broad,
 # well-documented skill differences; ECMWF/ICON tend to score best.
 OPEN_METEO_MODELS: dict[str, tuple[str, float]] = {
-    "ecmwf_ifs04": ("ECMWF IFS", 1.3),
+    # ifs025 is the 0.25-degree IFS; it has better short-range coverage than
+    # ifs04, which can return nulls for the nearest day.
+    "ecmwf_ifs025": ("ECMWF IFS", 1.3),
     "gfs_seamless": ("NOAA GFS", 1.0),
     "icon_seamless": ("DWD ICON", 1.2),
     "gem_seamless": ("Canada GEM", 0.9),
@@ -52,29 +55,40 @@ def fetch_all(
     include_metno: bool = True,
     on_error=None,
 ) -> list[SourceForecast]:
-    """Fetch every available source. ``on_error(name, exc)`` is called for
-    sources that fail (so the CLI can warn) instead of aborting."""
-    sources: list[SourceForecast] = []
+    """Fetch every available source concurrently.
 
+    Sources are fetched in parallel (each is an independent HTTP call), which
+    cuts latency from the sum of the per-source round-trips to roughly the
+    slowest single one. ``on_error(name, exc)`` is called for sources that fail
+    so the caller can warn instead of aborting; results keep a stable order
+    (Open-Meteo models in declaration order, then MET Norway).
+    """
+    jobs: list[tuple[str, callable]] = []
     for model_id, (name, weight) in OPEN_METEO_MODELS.items():
+        jobs.append((
+            name,
+            lambda mid=model_id, n=name, w=weight: fetch_open_meteo_model(
+                location, mid, n, w, days),
+        ))
+    if include_metno:
+        jobs.append(("MET Norway", lambda: fetch_met_no(location, days)))
+
+    results: list[SourceForecast | None] = [None] * len(jobs)
+
+    def run(idx: int, name: str, fn) -> None:
         try:
-            sf = fetch_open_meteo_model(location, model_id, name, weight, days)
+            sf = fn()
             if sf.days:
-                sources.append(sf)
+                results[idx] = sf
         except (HTTPError, KeyError, ValueError, TypeError) as exc:
             if on_error:
                 on_error(name, exc)
 
-    if include_metno:
-        try:
-            sf = fetch_met_no(location, days)
-            if sf.days:
-                sources.append(sf)
-        except (HTTPError, KeyError, ValueError, TypeError) as exc:
-            if on_error:
-                on_error("MET Norway", exc)
+    with ThreadPoolExecutor(max_workers=len(jobs) or 1) as ex:
+        for fut in [ex.submit(run, i, n, fn) for i, (n, fn) in enumerate(jobs)]:
+            fut.result()  # surface unexpected (non-handled) errors, if any
 
-    return sources
+    return [sf for sf in results if sf is not None]
 
 
 def fetch_open_meteo_model(

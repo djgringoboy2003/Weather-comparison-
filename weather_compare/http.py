@@ -9,13 +9,20 @@ for transient network errors.
 from __future__ import annotations
 
 import json
+import os
 import time
 import urllib.error
 import urllib.parse
 import urllib.request
 from typing import Any, Mapping
 
-USER_AGENT = "weather-compare/1.0 (https://github.com/; contact via repository)"
+# MET Norway (and good API etiquette generally) requires a self-identifying
+# User-Agent with a way to make contact. Override via the WEATHER_USER_AGENT
+# env var when deploying under your own domain/contact.
+USER_AGENT = os.environ.get(
+    "WEATHER_USER_AGENT",
+    "weather-compare/1.1 (+https://github.com/djgringoboy2003/Weather-comparison-)",
+)
 
 DEFAULT_TIMEOUT = 15
 DEFAULT_RETRIES = 3
